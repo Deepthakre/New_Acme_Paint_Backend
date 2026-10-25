@@ -12,6 +12,10 @@ export const withdrawSchema = z.object({
 });
 
 export const batchIdBodySchema = z.object({ batchId: z.string().trim().min(1).max(40) });
+export const generateStickersSchema = z.object({
+  count: z.coerce.number().int().min(1).max(1000),
+  label: z.string().trim().max(40).optional().default(''),
+});
 export const productQrParamSchema = z.object({ productQr: z.string().trim().min(1).max(60) });
 export const idParamSchema = z.object({ id: z.string().trim().min(1).max(60) });
 

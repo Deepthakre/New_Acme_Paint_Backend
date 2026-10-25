@@ -2,7 +2,7 @@ import type { Request, Response } from 'express';
 import { asyncHandler } from '../utils/asyncHandler';
 import { ApiError } from '../utils/ApiError';
 import { RewardCode } from '../models/RewardCode';
-import { generateCodesForBatch, redeemRewardCode, reissueCode } from '../services/reward.service';
+import { generateStickerCodes, redeemRewardCode, reissueCode } from '../services/reward.service';
 
 function deviceIdFrom(req: Request): string | null {
   const raw = req.headers['x-device-id'];
@@ -28,7 +28,7 @@ export const redeemReward = asyncHandler(async (req: Request, res: Response) => 
 
 /** Mints inner codes for every bucket of a batch without one. Plain codes are in THIS response only. */
 export const generateBatchCodes = asyncHandler(async (req: Request, res: Response) => {
-  const result = await generateCodesForBatch(req.body.batchId, req.user!.id);
+ const result = await generateStickerCodes(req.body.count, req.body.label, req.user!.id);
   res.setHeader('Cache-Control', 'no-store');
   res.status(201).json({ success: true, data: result });
 });

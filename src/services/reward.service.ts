@@ -135,7 +135,7 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
   // 2. Lookup by HASH only. The inner code AND the outer-label bucket ID must point to the SAME bucket.
   //    Unknown code, wrong bucket ID and bad checksum all get the same message (no oracle for guessers).
   const rc = await RewardCode.findOne({ codeHash: hashRewardCode(code), isCurrent: true }).lean();
-  if (!rc || rc.productQr.toUpperCase() !== bucketQrId) {
+ if (!rc) {
     await registerFailedRedeem(painter.id);
     throw ApiError.badRequest(WRONG);
   }
@@ -147,8 +147,15 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
 
   // 3. Bucket check. By default a reward does NOT depend on the dealer scanning the sale
   //    (REWARD_REQUIRE_SOLD=false). Returned buckets are always refused.
-  const product = await Product.findOne({ qr: rc.productQr }).select('qr product size status active').lean();
-  if (!product) throw ApiError.badRequest('This reward code is not valid.');
+  const product = await Product.findOne({ qr: bucketQrId }).select('qr product size status active').lean();
+if (!product) {
+  await registerFailedRedeem(painter.id);
+  throw ApiError.badRequest(WRONG);
+}
+// One reward per bucket: same PRD number cannot be claimed twice.
+if (await RewardCode.exists({ productQr: bucketQrId, status: { $in: ['REDEEMED', 'HELD'] } })) {
+  throw ApiError.conflict('A reward for this bucket has already been claimed.');
+}
   if (product.status === 'RETURNED') throw ApiError.badRequest('This reward code is no longer valid.');
   if (env.REWARD_REQUIRE_SOLD && product.status !== 'SOLD') {
     throw ApiError.badRequest('This bucket has not been recorded as sold yet. Ask the dealer to complete the sale, then scan again.');
@@ -198,22 +205,29 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
 
   // 6. ATOMIC claim + budget + ledger in one transaction.
   const balancePaise = await runInTransaction(async (session) => {
-    const claimed = await RewardCode.findOneAndUpdate(
-      { _id: rc._id, status: 'ACTIVE' }, // <- the race guard: only ONE of two simultaneous scans can flip ACTIVE -> claimed
-      {
-        $set: {
-          status: hold ? 'HELD' : 'REDEEMED',
-          painterId: painter.id,
-          redeemedAt: now,
-          amountPaise,
-          campaignId: campaign.id,
-          heldReason: hold ? holds.map((h) => h.type).join(',') : null,
-          deviceId,
-          ip,
+      let claimed;
+    try {
+      claimed = await RewardCode.findOneAndUpdate(
+        { _id: rc._id, status: 'ACTIVE' },
+        {
+          $set: {
+            status: hold ? 'HELD' : 'REDEEMED',
+            productQr: bucketQrId,
+            painterId: painter.id,
+            redeemedAt: now,
+            amountPaise,
+            campaignId: campaign.id,
+            heldReason: hold ? holds.map((h) => h.type).join(',') : null,
+            deviceId,
+            ip,
+          },
         },
-      },
-      { new: true, session }
-    );
+        { new: true, session }
+      );
+    } catch (e) {
+      if ((e as { code?: number }).code === 11000) throw ApiError.conflict('A reward for this bucket has already been claimed.');
+      throw e;
+    }
     if (!claimed) throw ApiError.conflict('This reward has already been claimed.');
 
     try {
@@ -225,7 +239,7 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
       // The painter opened the bucket, so it has reached the end customer: mark it SOLD
       // (no matter whether the dealer scanned the sale). Already SOLD/RETURNED units are left untouched.
       await Product.updateOne(
-        { qr: rc.productQr, status: { $in: ['FACTORY', 'TRANSIT', 'DEALER'] } },
+        { qr: bucketQrId, status: { $in: ['FACTORY', 'TRANSIT', 'DEALER'] } },
         {
           $set: { status: 'SOLD', holder: `Painter ${painter.id}` },
           $push: { log: { event: 'SOLD - reward claimed by painter (inner QR scanned)', who: painter.id, time: nowStr(), ts: Date.now() } },
@@ -235,9 +249,9 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
 
       if (hold) {
         for (const h of holds) {
-          await raiseFlag({ type: h.type, painterId: painter.id, rewardCodeId: String(rc._id), productQr: rc.productQr, details: h.details }, session);
+          await raiseFlag({ type: h.type, painterId: painter.id, rewardCodeId: String(rc._id), productQr: bucketQrId, details: h.details }, session);
         }
-        await audit({ action: 'REWARD_HELD', actorType: 'PAINTER', actorId: painter.id, refType: 'REWARD_CODE', refId: String(rc._id), meta: { productQr: rc.productQr, amountPaise, reasons: holds.map((h) => h.type) }, ip }, session);
+        await audit({ action: 'REWARD_HELD', actorType: 'PAINTER', actorId: painter.id, refType: 'REWARD_CODE', refId: String(rc._id), meta: { productQr: bucketQrId, amountPaise, reasons: holds.map((h) => h.type) }, ip }, session);
         return getBalancePaise(painter.id, session);
       }
 
@@ -246,14 +260,14 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
         type: 'REWARD',
         refType: 'REWARD_CODE',
         refId: String(rc._id),
-        note: `Reward for ${product.product} ${product.size} (${rc.productQr})`,
+        note: `Reward for ${product.product} ${product.size} (${bucketQrId})`,
         lines: [
           { account: SYS_REWARD_EXPENSE, direction: 'DEBIT', amountPaise },
           { account: painterAccount(painter.id), painterId: painter.id, direction: 'CREDIT', amountPaise },
         ],
         session,
       });
-      await audit({ action: 'REWARD_REDEEMED', actorType: 'PAINTER', actorId: painter.id, refType: 'REWARD_CODE', refId: String(rc._id), meta: { productQr: rc.productQr, amountPaise, campaignId: campaign.id }, ip }, session);
+      await audit({ action: 'REWARD_REDEEMED', actorType: 'PAINTER', actorId: painter.id, refType: 'REWARD_CODE', refId: String(rc._id), meta: { productQr: bucketQrId, amountPaise, campaignId: campaign.id }, ip }, session);
       return getBalancePaise(painter.id, session);
     } catch (err) {
       // Inside a real transaction the whole thing rolls back by itself. Only the
@@ -282,7 +296,7 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
     await notifyAdmins({
       type: 'REWARD_HELD',
       title: `Claim on hold: ${painter.name} · ${rs(amountPaise)}`,
-      body: `Bucket ${rc.productQr} · ${holds.map((h) => h.type).join(', ')}. Review it in Fraud / holds.`,
+      body: `Bucket ${bucketQrId} · ${holds.map((h) => h.type).join(', ')}. Review it in Fraud / holds.`,
       refType: 'REWARD_CODE',
       refId: String(rc._id),
     });
@@ -304,10 +318,10 @@ export async function redeemRewardCode(input: RedeemInput): Promise<RedeemOutcom
     await notifyAdmins({
       type: 'REWARD_CLAIMED',
       title: `${painter.name} claimed ${rs(amountPaise)}`,
-      body: `Mobile ${painter.mobile} · bucket ${rc.productQr} (${product.product} ${product.size}) · UPI ${upi}${payout ? ` · payout ${payout.id} (${payout.status})` : ''}`,
+      body: `Mobile ${painter.mobile} · bucket ${bucketQrId} (${product.product} ${product.size}) · UPI ${upi}${payout ? ` · payout ${payout.id} (${payout.status})` : ''}`,
       refType: 'REWARD_CODE',
       refId: String(rc._id),
-      meta: { painterId: painter.id, productQr: rc.productQr, amountPaise },
+      meta: { painterId: painter.id, productQr: bucketQrId, amountPaise },
     });
   }
 
@@ -438,31 +452,18 @@ export interface PrintableCode {
  * Mints one inner reward code per bucket of a batch that has none yet. The
  * plain codes are returned ONCE (to print) and never stored - only their hash.
  */
-export async function generateCodesForBatch(batchId: string, adminId: string): Promise<{ generated: number; alreadyHadCode: number; codes: PrintableCode[] }> {
-  const batch = await Batch.findOne({ id: batchId }).lean();
-  if (!batch) throw ApiError.notFound('Batch not found.');
-
-  const [products, existing] = await Promise.all([
-    Product.find({ batchId }).select('qr product size').lean(),
-    RewardCode.find({ batchId, isCurrent: true }).select('productQr').lean(),
-  ]);
-  const have = new Set(existing.map((e) => e.productQr));
-  const todo = products.filter((p) => !have.has(p.qr));
-
+export async function generateStickerCodes(count: number, label: string, adminId: string): Promise<{ generated: number; label: string; codes: PrintableCode[] }> {
+  const batchLabel = label || `STICKERS-${new Date().toISOString().slice(0, 10)}`;
   const out: PrintableCode[] = [];
-  const CHUNK = 1000;
-  for (let i = 0; i < todo.length; i += CHUNK) {
-    const slice = todo.slice(i, i + CHUNK);
-    const docs = slice.map((p) => {
-      const code = generateRewardCode();
-      out.push({ productQr: p.qr, product: p.product, size: p.size, code });
-      return { codeHash: hashRewardCode(code), productQr: p.qr, batchId };
-    });
-    await RewardCode.insertMany(docs, { ordered: true });
+  const docs = [];
+  for (let i = 0; i < count; i++) {
+    const code = generateRewardCode();
+    out.push({ productQr: '', product: '', size: '', code });
+    docs.push({ codeHash: hashRewardCode(code), batchId: batchLabel });
   }
-
-  await audit({ action: 'REWARD_CODES_GENERATED', actorType: 'ADMIN', actorId: adminId, refType: 'BATCH', refId: batchId, meta: { generated: out.length, alreadyHadCode: have.size } });
-  return { generated: out.length, alreadyHadCode: have.size, codes: out };
+  await RewardCode.insertMany(docs, { ordered: true });
+  await audit({ action: 'REWARD_CODES_GENERATED', actorType: 'ADMIN', actorId: adminId, refType: 'STICKER_RUN', refId: batchLabel, meta: { generated: count } });
+  return { generated: count, label: batchLabel, codes: out };
 }
 
 /** Wasted / damaged sticker: retire the old code and mint a fresh one for the same bucket. */

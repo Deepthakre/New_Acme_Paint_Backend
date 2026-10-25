@@ -12,6 +12,7 @@ import {
   idParamSchema,
   batchIdBodySchema,
   productQrParamSchema,
+  generateStickersSchema
 } from '../validators/reward.validators';
 import * as admin from '../controllers/rewardAdmin.controller';
 import * as rewards from '../controllers/reward.controller';
@@ -39,7 +40,7 @@ router.get('/notifications', validate({ query: paginationQuerySchema }), admin.l
 router.post('/notifications/read-all', admin.markNotificationsRead);
 
 // Inner reward QR codes (printing)
-router.post('/reward-codes/generate', validate({ body: batchIdBodySchema }), rewards.generateBatchCodes);
+router.post('/reward-codes/generate', validate({ body: generateStickersSchema }), rewards.generateBatchCodes);
 router.get('/reward-codes/summary', rewards.codeSummary);
 router.post('/reward-codes/:productQr/reissue', validate({ params: productQrParamSchema }), rewards.reissueBucketCode);
 

@@ -13,7 +13,7 @@ export interface IRewardCode {
   /** HMAC of the code. The plain code is NEVER stored. */
   codeHash: string;
   /** The bucket (Product.qr) this code is sealed inside. */
-  productQr: string;
+ productQr: string | null; 
   batchId: string;
   status: RewardCodeStatus;
   /** Only the current code for a bucket is isCurrent=true (a reissued/reprinted code retires the old one). */
@@ -33,8 +33,8 @@ export interface IRewardCode {
 const schema = new Schema<IRewardCode>(
   {
     codeHash: { type: String, required: true, unique: true, index: true },
-    productQr: { type: String, required: true, index: true },
-    batchId: { type: String, required: true, index: true },
+    productQr: { type: String, default: null },
+batchId: { type: String, default: '', index: true },
     status: { type: String, enum: ['ACTIVE', 'HELD', 'REDEEMED', 'VOID'], default: 'ACTIVE', index: true },
     isCurrent: { type: Boolean, default: true },
     generatedAt: { type: Date, default: () => new Date() },
@@ -50,7 +50,8 @@ const schema = new Schema<IRewardCode>(
 );
 
 // One CURRENT code per bucket, enforced by the database (partial unique index).
-schema.index({ productQr: 1 }, { unique: true, partialFilterExpression: { isCurrent: true } });
+// neeche wali index line replace:
+schema.index({ productQr: 1 }, { unique: true, partialFilterExpression: { productQr: { $type: 'string' } } });
 schema.index({ painterId: 1, redeemedAt: -1 });
 schema.index({ deviceId: 1, redeemedAt: -1 }, { sparse: true });
 
